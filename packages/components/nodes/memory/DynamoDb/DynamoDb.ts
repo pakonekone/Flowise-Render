@@ -9,15 +9,15 @@ import {
     DeleteItemCommandInput,
     AttributeValue
 } from '@aws-sdk/client-dynamodb'
-import { DynamoDBChatMessageHistory } from 'langchain/stores/message/dynamodb'
+import { DynamoDBChatMessageHistory } from '@langchain/community/stores/message/dynamodb'
+import { mapStoredMessageToChatMessage, AIMessage, HumanMessage, StoredMessage, BaseMessage } from '@langchain/core/messages'
 import { BufferMemory, BufferMemoryInput } from 'langchain/memory'
-import { mapStoredMessageToChatMessage, AIMessage, HumanMessage, StoredMessage, BaseMessage } from 'langchain/schema'
 import {
     convertBaseMessagetoIMessage,
     getBaseClasses,
     getCredentialData,
     getCredentialParam,
-    serializeChatHistory
+    mapChatMessageToBaseMessage
 } from '../../../src/utils'
 import { FlowiseMemory, ICommonObject, IMessage, INode, INodeData, INodeParams, MemoryMethods, MessageType } from '../../../src/Interface'
 
@@ -46,7 +46,8 @@ class DynamoDb_Memory implements INode {
             label: 'Connect Credential',
             name: 'credential',
             type: 'credential',
-            credentialNames: ['dynamodbMemoryApi']
+            credentialNames: ['dynamodbMemoryApi'],
+            optional: true
         }
         this.inputs = [
             {
@@ -70,7 +71,8 @@ class DynamoDb_Memory implements INode {
                 label: 'Session ID',
                 name: 'sessionId',
                 type: 'string',
-                description: 'If not specified, the first CHAT_MESSAGE_ID will be used as sessionId',
+                description:
+                    'If not specified, a random id will be used. Learn <a target="_blank" href="https://docs.flowiseai.com/memory/long-term-memory#ui-and-embedded-chat">more</a>',
                 default: '',
                 additionalParams: true,
                 optional: true
@@ -86,56 +88,32 @@ class DynamoDb_Memory implements INode {
     }
 
     async init(nodeData: INodeData, _: string, options: ICommonObject): Promise<any> {
-        return initalizeDynamoDB(nodeData, options)
-    }
-
-    //@ts-ignore
-    memoryMethods = {
-        async clearSessionMemory(nodeData: INodeData, options: ICommonObject): Promise<void> {
-            const dynamodbMemory = await initalizeDynamoDB(nodeData, options)
-            const sessionId = nodeData.inputs?.sessionId as string
-            const chatId = options?.chatId as string
-            options.logger.info(`Clearing DynamoDb memory session ${sessionId ? sessionId : chatId}`)
-            await dynamodbMemory.clear()
-            options.logger.info(`Successfully cleared DynamoDb memory session ${sessionId ? sessionId : chatId}`)
-        },
-        async getChatMessages(nodeData: INodeData, options: ICommonObject): Promise<string> {
-            const memoryKey = nodeData.inputs?.memoryKey as string
-            const dynamodbMemory = await initalizeDynamoDB(nodeData, options)
-            const key = memoryKey ?? 'chat_history'
-            const memoryResult = await dynamodbMemory.loadMemoryVariables({})
-            return serializeChatHistory(memoryResult[key])
-        }
+        return initializeDynamoDB(nodeData, options)
     }
 }
 
-const initalizeDynamoDB = async (nodeData: INodeData, options: ICommonObject): Promise<BufferMemory> => {
+const initializeDynamoDB = async (nodeData: INodeData, options: ICommonObject): Promise<BufferMemory> => {
     const tableName = nodeData.inputs?.tableName as string
     const partitionKey = nodeData.inputs?.partitionKey as string
     const region = nodeData.inputs?.region as string
     const memoryKey = nodeData.inputs?.memoryKey as string
-    const chatId = options.chatId
-
-    let isSessionIdUsingChatMessageId = false
-    let sessionId = ''
-
-    if (!nodeData.inputs?.sessionId && chatId) {
-        isSessionIdUsingChatMessageId = true
-        sessionId = chatId
-    } else {
-        sessionId = nodeData.inputs?.sessionId
-    }
+    const sessionId = nodeData.inputs?.sessionId as string
 
     const credentialData = await getCredentialData(nodeData.credential ?? '', options)
     const accessKeyId = getCredentialParam('accessKey', credentialData, nodeData)
     const secretAccessKey = getCredentialParam('secretAccessKey', credentialData, nodeData)
 
-    const config: DynamoDBClientConfig = {
-        region,
-        credentials: {
+    let credentials: DynamoDBClientConfig['credentials'] | undefined
+    if (accessKeyId && secretAccessKey) {
+        credentials = {
             accessKeyId,
             secretAccessKey
         }
+    }
+
+    const config: DynamoDBClientConfig = {
+        region,
+        credentials
     }
 
     const client = new DynamoDBClient(config ?? {})
@@ -150,17 +128,21 @@ const initalizeDynamoDB = async (nodeData: INodeData, options: ICommonObject): P
     const memory = new BufferMemoryExtended({
         memoryKey: memoryKey ?? 'chat_history',
         chatHistory: dynamoDb,
-        isSessionIdUsingChatMessageId,
         sessionId,
-        dynamodbClient: client
+        dynamodbClient: client,
+        tableName,
+        partitionKey,
+        dynamoKey: { [partitionKey]: { S: sessionId } }
     })
     return memory
 }
 
 interface BufferMemoryExtendedInput {
-    isSessionIdUsingChatMessageId: boolean
     dynamodbClient: DynamoDBClient
     sessionId: string
+    tableName: string
+    partitionKey: string
+    dynamoKey: Record<string, AttributeValue>
 }
 
 interface DynamoDBSerializedChatMessage {
@@ -178,7 +160,10 @@ interface DynamoDBSerializedChatMessage {
 }
 
 class BufferMemoryExtended extends FlowiseMemory implements MemoryMethods {
-    isSessionIdUsingChatMessageId = false
+    private tableName = ''
+    private partitionKey = ''
+    private dynamoKey: Record<string, AttributeValue>
+    private messageAttributeName: string
     sessionId = ''
     dynamodbClient: DynamoDBClient
 
@@ -186,11 +171,14 @@ class BufferMemoryExtended extends FlowiseMemory implements MemoryMethods {
         super(fields)
         this.sessionId = fields.sessionId
         this.dynamodbClient = fields.dynamodbClient
+        this.tableName = fields.tableName
+        this.partitionKey = fields.partitionKey
+        this.dynamoKey = fields.dynamoKey
     }
 
     overrideDynamoKey(overrideSessionId = '') {
-        const existingDynamoKey = (this as any).dynamoKey
-        const partitionKey = (this as any).partitionKey
+        const existingDynamoKey = this.dynamoKey
+        const partitionKey = this.partitionKey
 
         let newDynamoKey: Record<string, AttributeValue> = {}
 
@@ -243,13 +231,17 @@ class BufferMemoryExtended extends FlowiseMemory implements MemoryMethods {
         await client.send(new UpdateItemCommand(params))
     }
 
-    async getChatMessages(overrideSessionId = '', returnBaseMessages = false): Promise<IMessage[] | BaseMessage[]> {
+    async getChatMessages(
+        overrideSessionId = '',
+        returnBaseMessages = false,
+        prependMessages?: IMessage[]
+    ): Promise<IMessage[] | BaseMessage[]> {
         if (!this.dynamodbClient) return []
 
-        const dynamoKey = overrideSessionId ? this.overrideDynamoKey(overrideSessionId) : (this as any).dynamoKey
-        const tableName = (this as any).tableName
-        const messageAttributeName = (this as any).messageAttributeName
+        const dynamoKey = overrideSessionId ? this.overrideDynamoKey(overrideSessionId) : this.dynamoKey
+        const tableName = this.tableName
 
+        const messageAttributeName = this.messageAttributeName ? this.messageAttributeName : 'messages'
         const params: GetItemCommandInput = {
             TableName: tableName,
             Key: dynamoKey
@@ -267,15 +259,18 @@ class BufferMemoryExtended extends FlowiseMemory implements MemoryMethods {
             }))
             .filter((x): x is StoredMessage => x.type !== undefined && x.data.content !== undefined)
         const baseMessages = messages.map(mapStoredMessageToChatMessage)
+        if (prependMessages?.length) {
+            baseMessages.unshift(...mapChatMessageToBaseMessage(prependMessages))
+        }
         return returnBaseMessages ? baseMessages : convertBaseMessagetoIMessage(baseMessages)
     }
 
     async addChatMessages(msgArray: { text: string; type: MessageType }[], overrideSessionId = ''): Promise<void> {
         if (!this.dynamodbClient) return
 
-        const dynamoKey = overrideSessionId ? this.overrideDynamoKey(overrideSessionId) : (this as any).dynamoKey
-        const tableName = (this as any).tableName
-        const messageAttributeName = (this as any).messageAttributeName
+        const dynamoKey = overrideSessionId ? this.overrideDynamoKey(overrideSessionId) : this.dynamoKey
+        const tableName = this.tableName
+        const messageAttributeName = this.messageAttributeName
 
         const input = msgArray.find((msg) => msg.type === 'userMessage')
         const output = msgArray.find((msg) => msg.type === 'apiMessage')
@@ -296,8 +291,8 @@ class BufferMemoryExtended extends FlowiseMemory implements MemoryMethods {
     async clearChatMessages(overrideSessionId = ''): Promise<void> {
         if (!this.dynamodbClient) return
 
-        const dynamoKey = overrideSessionId ? this.overrideDynamoKey(overrideSessionId) : (this as any).dynamoKey
-        const tableName = (this as any).tableName
+        const dynamoKey = overrideSessionId ? this.overrideDynamoKey(overrideSessionId) : this.dynamoKey
+        const tableName = this.tableName
 
         const params: DeleteItemCommandInput = {
             TableName: tableName,
@@ -305,10 +300,6 @@ class BufferMemoryExtended extends FlowiseMemory implements MemoryMethods {
         }
         await this.dynamodbClient.send(new DeleteItemCommand(params))
         await this.clear()
-    }
-
-    async resumeMessages(): Promise<void> {
-        return
     }
 }
 
